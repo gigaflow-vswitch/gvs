@@ -224,6 +224,9 @@ void flow_wildcards_set_xxreg_mask(struct flow_wildcards *,
 void flow_wildcards_and(struct flow_wildcards *dst,
                         const struct flow_wildcards *src1,
                         const struct flow_wildcards *src2);
+/* Gigaflow: returns true if src1 and src2 overlap in any field */
+bool flow_wildcards_overlap(const struct flow_wildcards *src1,
+                            const struct flow_wildcards *src2);
 void flow_wildcards_or(struct flow_wildcards *dst,
                        const struct flow_wildcards *src1,
                        const struct flow_wildcards *src2);

@@ -33,8 +33,24 @@
 #include "packets.h"
 #include "uuid.h"
 
-VLOG_DEFINE_THIS_MODULE(netdev_offload_dpdk);
+// VLOG_DEFINE_THIS_MODULE(netdev_offload_dpdk);
+VLOG_DEFINE_THIS_MODULE(netdev_offload_dpdk_p4sdnet);  // annus
 static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(600, 600);
+
+// /* SDNet PCIe variables for Gigaflow offload */
+// #define XILINX_FPGA_SYSFS_FILE  "/sys/bus/pci/devices/0000:00:11.0/resource2"
+// #define P4_SDNET_BASE_ADDRESS   0x18000
+
+/* Gigaflow P4SDNet key lengths */
+#define GIGAFLOW_KEY_LEN            29
+#define GIGAFLOW_ACTION_LEN         2
+#define GIGAFLOW_LOW_PRIORITY       1000
+#define GIGAFLOW_STANDARD_PRIORITY  100
+#define NETFPGA_CMAC_0              0x01
+#define NETFPGA_CMAC_1              0x04
+#define NETFPGA_QDMA_0              0x02
+#define NETFPGA_QDMA_1              0x08
+
 
 /* Thread-safety
  * =============
@@ -72,6 +88,96 @@ struct netdev_offload_dpdk_data {
     uint64_t *rte_flow_counters;
     struct ovs_mutex map_lock;
 };
+
+/* Gigaflow tables available for P4SDNet offload */
+enum p4sdnet_tables {
+    P4SDNET_GIGAFLOW_TABLE_0,
+    P4SDNET_GIGAFLOW_TABLE_1,
+    P4SDNET_GIGAFLOW_TABLE_2,
+    P4SDNET_GIGAFLOW_TABLE_3,
+
+    P4SDNET_GIGAFLOW_TABLE_MAX
+};
+
+/* Gigaflow actions available for P4SDNet offload */
+enum p4sdnet_actions {
+    P4SDNET_FORWARD_ACTION,
+    P4SDNET_DROP_ACTION,
+    P4SDNET_INSERT_NEXT_TABLE_TAG_ACTION,
+    P4SDNET_INSERT_NEXT_TABLE_TAG_AND_FORWARD_ACTION,
+    P4SDNET_NO_ACTION,
+
+    P4SDNET_GIGAFLOW_ACTION_MAX
+};
+
+static char * p4sdnet_table_names[] = {"G0", "G1", "G2", "G3"};
+static char * p4sdnet_action_names[] = {"forward", "drop", 
+                                        "insert_next_table_tag", 
+                                        "insert_next_table_tag_and_forward", 
+                                        "NoAction", };
+
+/* P4SDNet key bytes for Gigaflow offload
+   tos=ff, in_port=ff, eth_src=0x000000000000, eth_dst=0x000000000000, 
+   eth_type=0x0000, nw_src=0x00000000, nw_dst=0x00000000, nw_proto=0x00, 
+   tp_src=0x0000, tp_dst=0x0000 */
+enum p4sdnet_key_bytes {
+    
+    P4SDNET_KEY_B0_TOS_B0,
+    
+    P4SDNET_KEY_B1_IN_PORT_B0,
+    
+    P4SDNET_KEY_B2_ETH_SRC_B0,
+    P4SDNET_KEY_B3_ETH_SRC_B1,
+    P4SDNET_KEY_B4_ETH_SRC_B2,
+    P4SDNET_KEY_B5_ETH_SRC_B3,
+    P4SDNET_KEY_B6_ETH_SRC_B4,
+    P4SDNET_KEY_B7_ETH_SRC_B5,
+    
+    P4SDNET_KEY_B8_ETH_DST_B0,
+    P4SDNET_KEY_B9_ETH_DST_B1,
+    P4SDNET_KEY_B10_ETH_DST_B2,
+    P4SDNET_KEY_B11_ETH_DST_B3,
+    P4SDNET_KEY_B12_ETH_DST_B4,
+    P4SDNET_KEY_B13_ETH_DST_B5,
+    
+    P4SDNET_KEY_B14_ETH_TYPE_B0,
+    P4SDNET_KEY_B15_ETH_TYPE_B1,
+    
+    P4SDNET_KEY_B16_NW_SRC_B0,
+    P4SDNET_KEY_B17_NW_SRC_B1,
+    P4SDNET_KEY_B18_NW_SRC_B2,
+    P4SDNET_KEY_B19_NW_SRC_B3,
+    
+    P4SDNET_KEY_B20_NW_DST_B0,
+    P4SDNET_KEY_B21_NW_DST_B1,
+    P4SDNET_KEY_B22_NW_DST_B2,
+    P4SDNET_KEY_B23_NW_DST_B3,
+    
+    P4SDNET_KEY_B24_NW_PROTO_B0,
+    
+    P4SDNET_KEY_B25_TP_SRC_B0,
+    P4SDNET_KEY_B26_TP_SRC_B1,
+    
+    P4SDNET_KEY_B27_TP_DST_B0,
+    P4SDNET_KEY_B28_TP_DST_B1,
+
+    P4SDNET_GIGAFLOW_KEY_BYTES_MAX
+};
+
+/* parameters for SDNet actions */
+enum p4sdnet_action_param_bytes {
+    P4SDNET_ACTION_PARAM_B0,
+    P4SDNET_ACTION_PARAM_B1,
+
+    P4SDNET_ACTION_PARAM_BYTES_MAX
+};
+
+/* offload context for p4sdnet offload */
+struct p4sdnet_offload_context {
+
+};
+
+static struct p4sdnet_offload_context p4sdnet_offload_ctx;
 
 static int
 offload_data_init(struct netdev *netdev)
@@ -2709,4 +2815,16 @@ const struct netdev_flow_api netdev_offload_dpdk = {
     .flow_flush = netdev_offload_dpdk_flow_flush,
     .hw_miss_packet_recover = netdev_offload_dpdk_hw_miss_packet_recover,
     .flow_get_n_flows = netdev_offload_dpdk_get_n_flows,
+};
+
+const struct netdev_flow_api netdev_offload_dpdk_p4sdnet = {
+    .type = "dpdk_p4sdnet_flow_api",
+    .flow_put = netdev_offload_dpdk_flow_put,
+    .flow_del = netdev_offload_dpdk_flow_del,
+    .init_flow_api = netdev_offload_dpdk_init_flow_api,
+    .uninit_flow_api = netdev_offload_dpdk_uninit_flow_api,
+    // .flow_get = netdev_offload_dpdk_flow_get,
+    // .flow_flush = netdev_offload_dpdk_flow_flush,
+    // .hw_miss_packet_recover = netdev_offload_dpdk_hw_miss_packet_recover,
+    // .flow_get_n_flows = netdev_offload_dpdk_get_n_flows,
 };

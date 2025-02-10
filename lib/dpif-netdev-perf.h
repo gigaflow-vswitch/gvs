@@ -35,6 +35,9 @@
 #include "unixctl.h"
 #include "util.h"
 
+#include "gigaflow-config.h"
+#include "gigaflow-perf.h"
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
@@ -302,7 +305,7 @@ cycle_timer_stop(struct pmd_perf_stats *s,
 /* Functions to initialize and reset the PMD performance metrics. */
 
 void pmd_perf_stats_init(struct pmd_perf_stats *s);
-void pmd_perf_stats_clear(struct pmd_perf_stats *s);
+void pmd_perf_stats_clear(struct pmd_perf_stats *s, struct gigaflow_perf_stats *gf_s);
 void pmd_perf_stats_clear_lock(struct pmd_perf_stats *s);
 
 /* Functions to read and update PMD counters. */
@@ -420,6 +423,8 @@ struct pmd_perf_params {
 };
 
 void pmd_perf_format_overall_stats(struct ds *str, struct pmd_perf_stats *s,
+                                   struct gigaflow_perf_stats *gf_s, 
+                                   struct gigaflow_config *gf_config,
                                    double duration);
 void pmd_perf_format_histograms(struct ds *str, struct pmd_perf_stats *s);
 void pmd_perf_format_iteration_history(struct ds *str,

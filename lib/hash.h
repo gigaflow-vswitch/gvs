@@ -43,6 +43,11 @@ static inline uint32_t hash_uint64(const uint64_t);
 static inline uint32_t hash_uint64_basis(const uint64_t x,
                                          const uint32_t basis);
 uint32_t hash_3words(uint32_t, uint32_t, uint32_t);
+uint32_t hash_4words(uint32_t, uint32_t, uint32_t, uint32_t);
+uint32_t hash_uint64_plus1(const uint64_t x);
+uint32_t hash_2words_plus1(uint32_t a, uint32_t b);
+uint32_t hash_3words_plus1(uint32_t a, uint32_t b, uint32_t c);
+uint32_t hash_4words_plus1(uint32_t a, uint32_t b, uint32_t c, uint32_t d);
 
 static inline uint32_t hash_boolean(bool x, uint32_t basis);
 uint32_t hash_double(double, uint32_t basis);

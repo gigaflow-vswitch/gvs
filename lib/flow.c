@@ -2131,6 +2131,43 @@ flow_wildcards_and(struct flow_wildcards *dst,
     }
 }
 
+/* returns true of src1 and src2 overlap in any field */
+bool flow_wildcards_overlap(const struct flow_wildcards *src1,
+                            const struct flow_wildcards *src2)
+{
+    /* consider Gigaflow fields only:
+       ethernet source and destination */
+    for (int i=0; i<6; i++) {
+        if (src1->masks.dl_src.ea[i] && src2->masks.dl_src.ea[i]) {
+            return true;
+        }
+        if (src1->masks.dl_dst.ea[i] && src2->masks.dl_dst.ea[i]) {
+            return true;
+        }
+    }
+    /* network source */
+    if (src1->masks.nw_src && src2->masks.nw_src) {
+        return true;
+    }
+    /* network destination */
+    if (src1->masks.nw_dst && src2->masks.nw_dst) {
+        return true;
+    }
+    /* network protocol */
+    if (src1->masks.nw_proto && src2->masks.nw_proto) {
+        return true;
+    }
+    /* transport source port */
+    if (src1->masks.tp_src && src2->masks.tp_src) {
+        return true;
+    }
+    /* transport destination port */
+    if (src1->masks.tp_dst && src2->masks.tp_dst) {
+        return true;
+    }
+    return false;
+}
+
 /* Sets 'dst' as the bitwise OR of wildcards in 'src1' and 'src2'.  That
  * is, a bit or a field is wildcarded in 'dst' if it is neither
  * wildcarded in 'src1' nor 'src2'. */

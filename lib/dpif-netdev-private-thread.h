@@ -35,6 +35,9 @@
 #include "dpif-netdev-private-extract.h"
 #include "openvswitch/thread.h"
 
+#include "gigaflow-perf.h"
+#include "mapper.h"
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
@@ -99,6 +102,14 @@ struct dp_netdev_pmd_thread {
     struct ccmap n_flows OVS_GUARDED;
     /* Number of flows in the 'simple_match_table' per in_port. */
     struct ccmap n_simple_flows OVS_GUARDED;
+
+    /* Flow tables for each of the Gigaflow classifiers */
+    struct cmap giga_flow_tables[_GIGAFLOW_NUM_TABLES] OVS_GUARDED; /* Giga Flow table. */
+    /* Number of flows in the 'flow_table' per in_port. */
+    struct ccmap n_giga_flows[_GIGAFLOW_NUM_TABLES] OVS_GUARDED;
+
+    /* Traversal-to-Gigaflow table's internal representation */
+    struct mapper_state map_state;
 
     /* One classifier per in_port polled by the pmd */
     struct cmap classifiers;
@@ -215,6 +226,7 @@ struct dp_netdev_pmd_thread {
 
     /* Keep track of detailed PMD performance statistics. */
     struct pmd_perf_stats perf_stats;
+    struct gigaflow_perf_stats gf_perf_stats;
 
     /* Stats from previous iteration used by automatic pmd
      * load balance logic. */

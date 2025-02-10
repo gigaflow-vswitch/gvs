@@ -51,10 +51,13 @@
 #include "dummy.h"
 #include "fat-rwlock.h"
 #include "flow.h"
+#include "gigaflow-config.h"
+#include "gigaflow-perf.h"
 #include "hmapx.h"
 #include "id-fpool.h"
 #include "id-pool.h"
 #include "ipf.h"
+#include "mapper.h"
 #include "mov-avg.h"
 #include "mpsc-queue.h"
 #include "netdev.h"
@@ -278,6 +281,8 @@ struct dp_netdev {
     atomic_bool pmd_perf_metrics;
     /* Enable the SMC cache from ovsdb config */
     atomic_bool smc_enable_db;
+    /* Gigaflow cache config params from ovsdb config */
+    struct gigaflow_config *gf_config;
 
     /* Protects access to ofproto-dpif-upcall interface during revalidator
      * thread synchronization. */
@@ -761,6 +766,9 @@ pmd_info_show_stats(struct ds *reply,
                   lookups_per_hit, stats[PMD_STAT_MISS], stats[PMD_STAT_LOST],
                   packets_per_batch);
 
+    /* show gigaflow statistics */
+    gf_perf_show_pmd_stats(reply, &pmd->gf_perf_stats, pmd->dp->gf_config);
+
     if (total_cycles == 0) {
         return;
     }
@@ -794,7 +802,8 @@ pmd_info_show_perf(struct ds *reply,
                    struct dp_netdev_pmd_thread *pmd,
                    struct pmd_perf_params *par)
 {
-    if (pmd->core_id != NON_PMD_CORE_ID) {
+    // if (pmd->core_id != NON_PMD_CORE_ID) 
+    {
         char *time_str =
                 xastrftime_msec("%H:%M:%S.###", time_wall_msec(), true);
         long long now = time_msec();
@@ -806,7 +815,9 @@ pmd_info_show_perf(struct ds *reply,
         ds_put_cstr(reply, "\n");
         format_pmd_thread(reply, pmd);
         ds_put_cstr(reply, "\n");
-        pmd_perf_format_overall_stats(reply, &pmd->perf_stats, duration);
+        pmd_perf_format_overall_stats(reply, &pmd->perf_stats, 
+                                      &pmd->gf_perf_stats,
+                                      pmd->dp->gf_config, duration);
         if (pmd_perf_metrics_enabled(pmd)) {
             /* Prevent parallel clearing of perf metrics. */
             ovs_mutex_lock(&pmd->perf_stats.clear_mutex);
@@ -1482,7 +1493,7 @@ dpif_netdev_pmd_info(struct unixctl_conn *conn, int argc, const char *argv[],
         if (type == PMD_INFO_SHOW_RXQ) {
             pmd_info_show_rxq(&reply, pmd);
         } else if (type == PMD_INFO_CLEAR_STATS) {
-            pmd_perf_stats_clear(&pmd->perf_stats);
+            pmd_perf_stats_clear(&pmd->perf_stats, &pmd->gf_perf_stats);
         } else if (type == PMD_INFO_SHOW_STATS) {
             pmd_info_show_stats(&reply, pmd);
         } else if (type == PMD_INFO_PERF_SHOW) {
@@ -1866,6 +1877,9 @@ create_dp_netdev(const char *name, const struct dpif_class *class,
         dp_netdev_free(dp);
         return error;
     }
+
+    /* init Gigaflow configurations */
+    dp->gf_config = gigaflow_config_init();
 
     dp->last_tnl_conf_seq = seq_read(tnl_conf_seq);
     *dpp = dp;
@@ -2382,7 +2396,12 @@ static void
 dp_netdev_flow_free(struct dp_netdev_flow *flow)
 {
     dp_netdev_actions_free(dp_netdev_flow_get_actions(flow));
-    free(flow->dp_extra_info);
+    /* TODO: revisit this.. */
+    // /* modify call to free extra_info only if it exists!
+    //    Gigaflows don't have these populated, so we need this */
+    // if (flow->dp_extra_info != NULL) {
+    //     free(flow->dp_extra_info);
+    // }
     free(flow);
 }
 
@@ -2416,11 +2435,15 @@ dp_netdev_pmd_find_dpcls(struct dp_netdev_pmd_thread *pmd,
     struct dpcls *cls = dp_netdev_pmd_lookup_dpcls(pmd, in_port);
     uint32_t hash = hash_port_no(in_port);
 
+    /* instantiate multiple Megaflow classifiers */
     if (!cls) {
-        /* Create new classifier for in_port */
-        cls = xmalloc(sizeof(*cls));
-        dpcls_init(cls);
-        cls->in_port = in_port;
+        /* Create new classifiers for in_port
+           1 for Megaflow; _GIGAFLOW_NUM_TABLES for Gigaflow  */
+        cls = xmalloc((_GIGAFLOW_NUM_TABLES + 1) * sizeof(*cls));
+        for (int k=0; k<(_GIGAFLOW_NUM_TABLES + 1); k++) {
+            dpcls_init(&cls[k]);
+            cls[k].in_port = in_port;
+        }
         cmap_insert(&pmd->classifiers, &cls->node, hash);
         VLOG_DBG("Creating dpcls %p for in_port %d", cls, in_port);
     }
@@ -3049,6 +3072,29 @@ dp_netdev_pmd_remove_flow(struct dp_netdev_pmd_thread *pmd,
 }
 
 static void
+dp_netdev_pmd_remove_gigaflow(struct dp_netdev_pmd_thread *pmd,
+                              struct dp_netdev_flow *flow, 
+                              int k)
+    OVS_REQUIRES(pmd->flow_mutex)
+{
+    struct cmap_node *node = CONST_CAST(struct cmap_node *, &flow->node);
+    struct dpcls *cls;
+    odp_port_t in_port = flow->flow.in_port.odp_port;
+
+    cls = dp_netdev_pmd_lookup_dpcls(pmd, in_port);
+    ovs_assert(cls != NULL);
+    /* flow must be removed from the Gigaflow table at k+1! */
+    dpcls_remove(&cls[k+1], &flow->cr);
+    /* remove the flow from the its own Gigaflow table only */
+    cmap_remove(&pmd->giga_flow_tables[k], node, dp_netdev_flow_hash(&flow->ufid));
+    ccmap_dec(&pmd->n_giga_flows[k], odp_to_u32(in_port));
+    queue_netdev_flow_del(pmd, flow);
+    flow->dead = true;
+
+    dp_netdev_flow_unref(flow);
+}
+
+static void
 dp_netdev_offload_flush_enqueue(struct dp_netdev *dp,
                                 struct netdev *netdev,
                                 struct ovs_barrier *barrier)
@@ -3143,6 +3189,12 @@ dp_netdev_pmd_flow_flush(struct dp_netdev_pmd_thread *pmd)
     ovs_mutex_lock(&pmd->flow_mutex);
     CMAP_FOR_EACH (netdev_flow, node, &pmd->flow_table) {
         dp_netdev_pmd_remove_flow(pmd, netdev_flow);
+    }
+    /* Clear all Gigaflow tables */
+    for (int k=0; k<_GIGAFLOW_NUM_TABLES; k++) {
+        CMAP_FOR_EACH (netdev_flow, node, &pmd->giga_flow_tables[k]) {
+            dp_netdev_pmd_remove_gigaflow(pmd, netdev_flow, k);
+        }
     }
     ovs_mutex_unlock(&pmd->flow_mutex);
 }
@@ -4128,11 +4180,196 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
         dp_netdev_simple_match_insert(pmd, flow);
     }
 
-    queue_netdev_flow_put(pmd, flow, match, actions, actions_len,
-                          orig_in_port, DP_NETDEV_FLOW_OFFLOAD_OP_ADD);
+    /* if we don't want Gigaflow offload, by default, we want
+       Megaflow offload */
+    const bool offload_gigaflow = pmd->dp->gf_config->offload_gigaflow;
+    if (!offload_gigaflow) {
+        queue_netdev_flow_put(pmd, flow, match, actions, actions_len,
+                              orig_in_port, DP_NETDEV_FLOW_OFFLOAD_OP_ADD);
+    }
     log_netdev_flow_change(flow, match, NULL, actions, actions_len);
 
     return flow;
+}
+
+static struct dp_netdev_flow *
+dp_netdev_pmd_lookup_subflow_in_gigaflow_cls_with_priorities(struct dp_netdev_pmd_thread *pmd,
+                                                             const struct netdev_flow_key *key,
+                                                             uint32_t g_id, int *lookup_num_p,
+                                                             uint32_t priority);
+
+// static struct dp_netdev_flow *
+// dp_netdev_pmd_lookup_subflow_in_gigaflow_cls(struct dp_netdev_pmd_thread *pmd,
+//                                              const struct netdev_flow_key *key,
+//                                              uint32_t g_id, int *lookup_num_p);
+
+/* installs entries into Gigaflow cache tables */
+static void
+dp_netdev_flow_add_gigaflow(struct dp_netdev_pmd_thread *pmd,
+                            struct match *match, const ovs_u128 *ufid,
+                            struct gigaflow_mapping_context *gf_map_ctx,
+                            odp_port_t orig_in_port)
+    OVS_REQUIRES(pmd->flow_mutex)
+{
+    /* no tables mapped, nothing to write to Gigaflow tables! */
+    if (OVS_UNLIKELY(gf_map_ctx->mapped_cnt == 0)) {
+        return;
+    }
+
+    /* Make sure in_port is exact matched before we read it. */
+    ovs_assert(match->wc.masks.in_port.odp_port == ODPP_NONE);
+    odp_port_t in_port = match->flow.in_port.odp_port;
+
+    /* Select dpcls for in_port. Relies on in_port to be exact match. */
+    struct dpcls *cls;
+    cls = dp_netdev_pmd_find_dpcls(pmd, in_port);
+
+    /**
+     * Here, we handle the flow insertion to our Gigaflow table and its 
+     * classifiers. We have K Gigaflow tables and K classifiers
+    */
+
+    // flows, masks and matches for Gigaflow tables
+    struct dp_netdev_flow *giga_flows[GIGAFLOW_TABLES_LIMIT];
+    struct netdev_flow_key giga_flow_masks[GIGAFLOW_TABLES_LIMIT];
+    struct match giga_flow_matches[GIGAFLOW_TABLES_LIMIT];
+
+    const uint32_t gigaflow_tables_limit = 
+        pmd->dp->gf_config->gigaflow_tables_limit;
+    const bool offload_gigaflow = pmd->dp->gf_config->offload_gigaflow;
+
+    // loop over each Gigaflow and create/install flow entries
+    for (int k=0; k<gigaflow_tables_limit; k++) {
+
+        // check for empty wildcards that the mapper didn't populate
+        if (!gf_map_ctx->has_mapping[k]) {
+            continue;
+        }
+
+        // create and initialize a new match for this Gigaflow entry
+        giga_flow_matches[k].tun_md.valid = false;
+        giga_flow_matches[k].flow = gf_map_ctx->accel_flows[k]; // match->flow;
+        giga_flow_matches[k].wc = gf_map_ctx->accel_wcs[k];
+        giga_flow_matches[k].table_id = k; // insert Gigaflow table ID
+        
+        // explicitly insert the in_port for these matches 
+        // the in_port is picked from the corresponding Megaflow in_port
+        giga_flow_matches[k].flow.in_port = match->flow.in_port;
+
+        /* Make sure in_port is exact matched before we read it. */
+        ovs_assert(giga_flow_matches[k].wc.masks.in_port.odp_port == ODPP_NONE);
+
+        // giga_flow_matches[k].wc.masks.in_port.odp_port = 0; // need it for recycling
+        netdev_flow_mask_init(&giga_flow_masks[k], &giga_flow_matches[k]);
+        giga_flow_matches[k].wc.masks.in_port.odp_port = ODPP_NONE;
+
+        /* set the number of 1 bits in wildcard as priority of match */
+        // giga_flow_matches[k].gf_priority = flowmap_n_1bits(giga_flow_masks[k].mf.map);
+
+        /* set priority using the mapping priority based on number of tables composed 
+           into this Gigaflow entry */
+        giga_flow_matches[k].gf_priority = gf_map_ctx->priorities[k];
+
+        /* Make sure wc does not have metadata. */
+        ovs_assert(!FLOWMAP_HAS_FIELD(&giga_flow_masks[k].mf.map, metadata)
+                   && !FLOWMAP_HAS_FIELD(&giga_flow_masks[k].mf.map, regs));
+
+        /* Do not allocate extra space. */
+        giga_flows[k] = xmalloc(sizeof *giga_flows[k] 
+                                - sizeof giga_flows[k]->cr.flow.mf 
+                                + giga_flow_masks[k].len);
+        memset(&giga_flows[k]->stats, 0, sizeof giga_flows[k]->stats);
+        atomic_init(&giga_flows[k]->netdev_flow_get_result, 0);
+        memset(&giga_flows[k]->last_stats, 0, sizeof giga_flows[k]->last_stats);
+        memset(&giga_flows[k]->last_attrs, 0, sizeof giga_flows[k]->last_attrs);
+        giga_flows[k]->dead = false;
+        giga_flows[k]->batch = NULL;
+        giga_flows[k]->mark = INVALID_FLOW_MARK;
+        *CONST_CAST(unsigned *, &giga_flows[k]->pmd_id) = pmd->core_id;
+        
+        // write the matching flow
+        *CONST_CAST(struct flow *, &giga_flows[k]->flow) = giga_flow_matches[k].flow;
+        *CONST_CAST(ovs_u128 *, &giga_flows[k]->ufid) = *ufid;
+        ovs_refcount_init(&giga_flows[k]->ref_cnt);
+        
+        // write the actions
+        void *acts_data = gf_map_ctx->accel_odp_actions[k].data;
+        size_t acts_len = gf_map_ctx->accel_odp_actions[k].size;
+        struct dp_netdev_actions *dp_netdev_acts;
+        dp_netdev_acts = dp_netdev_actions_create((const struct nlattr *)acts_data, 
+                                                  acts_len);
+        ovsrcu_set(&giga_flows[k]->actions, dp_netdev_acts);
+
+        dp_netdev_get_mega_ufid(&giga_flow_matches[k], 
+                                CONST_CAST(ovs_u128 *, &giga_flows[k]->mega_ufid));
+        netdev_flow_key_init_masked(&giga_flows[k]->cr.flow, &giga_flow_matches[k].flow, 
+                                    &giga_flow_masks[k]);
+
+        /* make sure our priorities are within range */
+        ovs_assert(giga_flow_matches[k].gf_priority < GIGAFLOW_PRIORITIES_LIMIT);
+
+        // lookup the flow in its own Gigaflow classifier
+        struct dp_netdev_flow *recycle_flow;
+        recycle_flow = dp_netdev_pmd_lookup_subflow_in_gigaflow_cls_with_priorities(pmd, 
+                                                                                    &giga_flows[k]->cr.flow, 
+                                                                                    k, NULL,
+                                                                                    giga_flow_matches[k].gf_priority);
+        if (OVS_LIKELY(recycle_flow)) {
+            // expand miniflow of the wildcard for comparison
+            // struct flow recycled_wildcard;
+            // miniflow_expand(&recycle_flow->cr.mask->mf, &recycled_wildcard);
+            // free the newly created flow
+            free(giga_flows[k]);
+            // free the newly created actions
+            dp_netdev_actions_free(dp_netdev_acts);
+            // update recycled sub-traversal stats
+            gf_perf_inc_cache_recycled(&pmd->gf_perf_stats, k);
+            continue;
+        }
+
+        /* convert priority and Gigaflow table ID to dpcls array index */
+        uint32_t dpcls_idx = _GET_GIGAFLOW_TABLE_ID(k, giga_flow_matches[k].gf_priority);
+
+        // Select dpcls for in_port. Relies on in_port to be exact match
+        // write the gigaflow match in our gigaflow classifier
+        dpcls_insert(&cls[dpcls_idx+1], &giga_flows[k]->cr, &giga_flow_masks[k]);
+
+        // write to gigaflow table
+        cmap_insert(&pmd->giga_flow_tables[dpcls_idx], 
+                    CONST_CAST(struct cmap_node *, &giga_flows[k]->node),
+                    dp_netdev_flow_hash(&giga_flows[k]->ufid));
+        ccmap_inc(&pmd->n_giga_flows[dpcls_idx], odp_to_u32(in_port));
+
+        if (offload_gigaflow) {
+            /* offload Gigaflow flows to hardware if available */
+            queue_netdev_flow_put(pmd, giga_flows[k], &giga_flow_matches[k], 
+                                  (const struct nlattr *)acts_data, 
+                                  acts_len, orig_in_port, 
+                                  DP_NETDEV_FLOW_OFFLOAD_OP_ADD);
+        }
+
+        /* increment this Gigaflow table's cache occupancy */
+        gf_perf_inc_cache_occupancy(&pmd->gf_perf_stats, k);
+
+        /* increment this Gigaflow table's cache occupancy with priority */
+        gf_perf_inc_cache_occupancy_with_priority(&pmd->gf_perf_stats, k, 
+                                                  giga_flow_matches[k].gf_priority);
+
+        /* update this Gigaflow table's mask occupancy */
+        gf_perf_add_mask_in_table(&pmd->gf_perf_stats, 
+                                  &gf_map_ctx->accel_bit_wc[k], 
+                                  &giga_flow_matches[k].wc,
+                                  k);
+        
+        /* update this unique masks usage in Gigaflow */
+        const bool estimate_flow_space = 
+            gf_map_ctx->gf_config->estimate_flow_space;
+        if (estimate_flow_space) {
+            gf_perf_inc_cache_occupancy_of_unique_mask_with_hash(&pmd->gf_perf_stats,
+                                                                 gf_map_ctx->unique_mapping_hash, 
+                                                                 k);
+        }
+    }
 }
 
 static int
@@ -4840,6 +5077,12 @@ dpif_netdev_set_config(struct dpif *dpif, const struct smap *other_config)
         }
     }
 
+    /* read and update Gigaflow configurations */
+    bool gf_state_updated = gigaflow_update_config(other_config, dp->gf_config);
+    if (gf_state_updated) {
+        dp_netdev_request_reconfigure(dp);
+    }
+
     if (!strcmp(pmd_rxq_assign, "roundrobin")) {
         pmd_rxq_assign_type = SCHED_ROUNDROBIN;
     } else if (!strcmp(pmd_rxq_assign, "cycles")) {
@@ -4924,6 +5167,7 @@ dpif_netdev_set_config(struct dpif *dpif, const struct smap *other_config)
     bool autolb_state = smap_get_bool(other_config, "pmd-auto-lb", false);
 
     set_pmd_auto_lb(dp, autolb_state, log_autolb);
+
     return 0;
 }
 
@@ -7445,6 +7689,13 @@ dp_netdev_configure_pmd(struct dp_netdev_pmd_thread *pmd, struct dp_netdev *dp,
     cmap_init(&pmd->simple_match_table);
     ccmap_init(&pmd->n_flows);
     ccmap_init(&pmd->n_simple_flows);
+    /* initialize the Gigaflow tables and their classifiers */
+    for (int k=0; k<_GIGAFLOW_NUM_TABLES; k++) {
+        cmap_init(&pmd->giga_flow_tables[k]);
+        ccmap_init(&pmd->n_giga_flows[k]);
+    }
+    /* initialize traversal mapper's state */
+    mapper_init(&pmd->map_state);
     pmd->ctx.last_rxq = NULL;
     pmd_thread_ctx_time_update(pmd);
     pmd->next_optimization = pmd->ctx.now + DPCLS_OPTIMIZATION_INTERVAL;
@@ -7475,6 +7726,7 @@ dp_netdev_configure_pmd(struct dp_netdev_pmd_thread *pmd, struct dp_netdev *dp,
         pmd_alloc_static_tx_qid(pmd);
     }
     pmd_perf_stats_init(&pmd->perf_stats);
+    gf_perf_stats_init(&pmd->gf_perf_stats);
     cmap_insert(&dp->poll_threads, CONST_CAST(struct cmap_node *, &pmd->node),
                 hash_int(core_id, 0));
 }
@@ -7501,10 +7753,17 @@ dp_netdev_destroy_pmd(struct dp_netdev_pmd_thread *pmd)
     cmap_destroy(&pmd->simple_match_table);
     ccmap_destroy(&pmd->n_flows);
     ccmap_destroy(&pmd->n_simple_flows);
+    for (int k=0; k<_GIGAFLOW_NUM_TABLES; k++) {
+        cmap_destroy(&pmd->giga_flow_tables[k]);
+        ccmap_destroy(&pmd->n_giga_flows[k]);
+    }
+    /* free the mapper state */
+    mapper_destroy(&pmd->map_state);
     ovs_mutex_destroy(&pmd->flow_mutex);
     seq_destroy(pmd->reload_seq);
     ovs_mutex_destroy(&pmd->port_mutex);
     ovs_mutex_destroy(&pmd->bond_mutex);
+    gf_perf_stats_destroy(&pmd->gf_perf_stats);
     free(pmd);
 }
 
@@ -7757,8 +8016,9 @@ dp_netdev_flow_used(struct dp_netdev_flow *netdev_flow, int cnt, int size,
 static int
 dp_netdev_upcall(struct dp_netdev_pmd_thread *pmd, struct dp_packet *packet_,
                  struct flow *flow, struct flow_wildcards *wc, ovs_u128 *ufid,
-                 enum dpif_upcall_type type, const struct nlattr *userdata,
-                 struct ofpbuf *actions, struct ofpbuf *put_actions)
+                 struct gigaflow_xlate_context *gf_xlate_ctx, enum dpif_upcall_type type, 
+                 const struct nlattr *userdata, struct ofpbuf *actions, 
+                 struct ofpbuf *put_actions)
 {
     struct dp_netdev *dp = pmd->dp;
 
@@ -7792,7 +8052,7 @@ dp_netdev_upcall(struct dp_netdev_pmd_thread *pmd, struct dp_packet *packet_,
     }
 
     return dp->upcall_cb(packet_, flow, ufid, pmd->core_id, type, userdata,
-                         actions, wc, put_actions, dp->upcall_aux);
+                         actions, wc, gf_xlate_ctx, put_actions, dp->upcall_aux);
 }
 
 static inline uint32_t
@@ -7986,6 +8246,324 @@ smc_lookup_batch(struct dp_netdev_pmd_thread *pmd,
     pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_SMC_HIT, n_smc_hit);
 }
 
+/* lookup a single sub-traversal (intermediate flow) in one Gigaflow table */
+struct dp_netdev_flow *
+dp_netdev_pmd_lookup_subflow_in_gigaflow_cls_with_priorities(struct dp_netdev_pmd_thread *pmd,
+                                                             const struct netdev_flow_key *key,
+                                                             uint32_t g_id, int *lookup_num_p,
+                                                             uint32_t priority)
+{
+    struct dpcls *cls;
+    struct dpcls_rule *rule = NULL;
+    odp_port_t in_port = u32_to_odp(MINIFLOW_GET_U32(&key->mf,
+                                                     in_port.odp_port));
+    struct dp_netdev_flow *netdev_flow = NULL;
+    cls = dp_netdev_pmd_lookup_dpcls(pmd, in_port);
+    if (OVS_LIKELY(cls)) {
+        /* loop over all priorities for this Gigaflow tables and do lookups */
+        uint32_t dpcls_idx = _GET_GIGAFLOW_TABLE_ID(g_id, priority) + 1;
+        dpcls_lookup(&cls[dpcls_idx], &key, &rule, 1, lookup_num_p);
+        /* new priorities are welcome */
+        if (rule) {
+            netdev_flow = dp_netdev_flow_cast(rule);
+        }
+    }
+    return netdev_flow;
+}
+
+/* lookup a set of sub-traversal (intermediate flow) in one Gigaflow table */
+static void
+dp_netdev_pmd_lookup_subflow_batch_in_gigaflow_cls_with_priorities(const struct netdev_flow_key **keys,
+                                                                   struct dpcls_rule **subflow_rules,
+                                                                   uint32_t g_id, const size_t cnt, 
+                                                                   int *lookup_num_p, struct dpcls *cls)
+{
+    /* process keys one at a time */
+    for (int i=0; i<cnt; i++) {
+        int looked_up = 0;
+        /* loop over all priorities for this Gigaflow tables and do lookups */
+        for (int p=GIGAFLOW_PRIORITIES_LIMIT-1; p>=0; p--) {
+            uint32_t dpcls_idx = _GET_GIGAFLOW_TABLE_ID(g_id, p) + 1;
+            /* perform lookup on keys and populate subflow_rules */
+            dpcls_lookup(&cls[dpcls_idx], &keys[i], &subflow_rules[i], 1, &looked_up);
+            if (looked_up) {
+                *lookup_num_p += looked_up;
+                break;
+            }
+        }
+    }
+}
+
+// /* lookup a single sub-traversal (intermediate flow) in one Gigaflow table */
+// struct dp_netdev_flow *
+// dp_netdev_pmd_lookup_subflow_in_gigaflow_cls(struct dp_netdev_pmd_thread *pmd,
+//                                              const struct netdev_flow_key *key,
+//                                              uint32_t g_id, int *lookup_num_p)
+// {
+//     struct dpcls *cls;
+//     struct dpcls_rule *rule = NULL;
+//     odp_port_t in_port = u32_to_odp(MINIFLOW_GET_U32(&key->mf,
+//                                                      in_port.odp_port));
+//     struct dp_netdev_flow *netdev_flow = NULL;
+
+//     cls = dp_netdev_pmd_lookup_dpcls(pmd, in_port);
+//     if (OVS_LIKELY(cls)) {
+//         dpcls_lookup(&cls[g_id], &key, &rule, 1, lookup_num_p);
+//         netdev_flow = dp_netdev_flow_cast(rule);
+//     }
+//     return netdev_flow;
+// }
+
+// /* lookup a set of sub-traversal (intermediate flow) in one Gigaflow table */
+// static void
+// dp_netdev_pmd_lookup_subflow_batch_in_gigaflow_cls(const struct netdev_flow_key **keys,
+//                                                    struct dpcls_rule **subflow_rules,
+//                                                    uint32_t g_id, const size_t cnt, 
+//                                                    int *lookup_num_p, struct dpcls *cls)
+// {
+//     uint32_t dpcls_idx = g_id + 1;
+//     /* perform lookup on keys and populate subflow_rules */
+//     dpcls_lookup(&cls[dpcls_idx], keys, subflow_rules, cnt, lookup_num_p);
+// }
+
+/* execute gigaflow subflow actions on a packet */
+static inline uint8_t
+dp_netdev_execute_gigaflow_subflow_actions(struct dp_netdev_pmd_thread *pmd,
+                                           struct dp_packet_batch *single_packet_batch,
+                                           struct dpcls_rule *gigaflow_subflow_rule,
+                                           struct dp_packet *packet, bool should_steal)
+{
+    /* pick the dp_netdev_flow from the matching rule */
+    struct dp_netdev_flow *matching_flow;
+    matching_flow = dp_netdev_flow_cast(gigaflow_subflow_rule);
+    
+    // pick the actions from the matching flow
+    struct dp_netdev_actions *matching_actions;
+    matching_actions = dp_netdev_flow_get_actions(matching_flow);
+
+    // create single-packet batch and execute actions
+    dp_packet_batch_init_packet(single_packet_batch, packet);
+    dp_netdev_execute_actions(pmd, single_packet_batch, should_steal, 
+                              &matching_flow->flow, matching_actions->actions, 
+                              matching_actions->size);
+
+    // return the table ID from the matching flow
+    return matching_flow->flow.nw_tos;
+}
+
+/* extract and populate key from packet */
+static inline void
+dp_netdev_extract_key_from_packet(struct dp_packet *packet,
+                                  struct netdev_flow_key *key,
+                                  bool md_is_valid)
+{
+    /* extract netdev_flow_key from given packet */
+    miniflow_extract(packet, &key->mf);
+    key->hash =
+            (md_is_valid == false)
+            ? dpif_netdev_packet_get_rss_hash_orig_pkt(packet, &key->mf)
+            : dpif_netdev_packet_get_rss_hash(packet, &key->mf);
+    /* Key length is needed in all the cases, hash computed on demand. */
+    key->len = netdev_flow_key_size(miniflow_n_values(&key->mf));
+}
+
+/* batch processing of a given set of packets in Gigaflow pipeline */
+static inline void
+gigaflow_lookup_batch(struct dp_netdev_pmd_thread *pmd,
+                      struct netdev_flow_key **missed_keys,
+                      struct dp_packet_batch *packets_,
+                      const int cnt,
+                      uint8_t *index_map)
+{
+#if !defined(__CHECKER__) && !defined(_WIN32)
+    const size_t PKT_ARRAY_SIZE = cnt;
+#else
+    /* Sparse or MSVC doesn't like variable length array. */
+    enum { PKT_ARRAY_SIZE = NETDEV_MAX_BURST };
+#endif
+
+    /* no packets to process? */
+    if (!cnt) {
+        return;
+    }
+
+    struct dp_packet *packet, *clone_packet;
+    size_t n_gigaflow_hit = 0, n_missed = 0;
+    struct dpcls_rule *subflow_rules[PKT_ARRAY_SIZE];
+    bool md_is_valid = false;
+    int recv_idx;
+    int i;
+
+    /* Get ingress port from first packet's metadata. */
+    odp_port_t in_port = packets_->packets[0]->md.in_port.odp_port;
+
+    /* Get the datapath classifier for this in_port 
+       without this classifier, we return without processing */
+    struct dpcls *cls;
+    cls = dp_netdev_pmd_lookup_dpcls(pmd, in_port);
+    if (!OVS_UNLIKELY(cls)) {
+        return; 
+    }
+
+    for (size_t j = 0; j < cnt; j++) {
+        /* Key length is needed in all the cases, hash computed on demand. */
+        missed_keys[j]->len = netdev_flow_key_size(
+            miniflow_n_values(&missed_keys[j]->mf));
+    }
+
+    /* maintain a copy of packets for Gigaflow processing 
+       we shouldn't modify the original packets in this pipeline */
+    struct dp_packet_batch clone_packets_obj, *clone_packets_;
+    dp_packet_batch_clone(&clone_packets_obj, packets_);
+    clone_packets_ = &clone_packets_obj;
+    
+    /* maintain a copy of netdev_flow_key for Gigaflow processing 
+       we shouldn't modify the original keys in this processing */
+    struct netdev_flow_key clone_missed_keys_obj[PKT_ARRAY_SIZE];
+    struct netdev_flow_key *clone_missed_keys[PKT_ARRAY_SIZE];
+    for (int j=0; j<PKT_ARRAY_SIZE; j++) {
+        netdev_flow_key_clone(&clone_missed_keys_obj[j], missed_keys[j]);
+        clone_missed_keys[j] = &clone_missed_keys_obj[j];
+    }
+
+    /* initialize Gigaflow cache hits to all misses
+       size set to given packet array size */ 
+    int gigaflow_hits[PKT_ARRAY_SIZE];
+    for (int p=0; p<PKT_ARRAY_SIZE; p++) {
+        gigaflow_hits[p] = 0;
+    }
+
+    const uint32_t gigaflow_tables_limit = 
+        pmd->dp->gf_config->gigaflow_tables_limit;
+
+    /* Gigaflow lookup loop over all Gigaflow tables 
+       For each table, perform a batched lookup for intermediate flows 
+       in the current Gigaflow table, then for the given packet batch 
+       and found hits in this table, process actions, */
+    for (int k=0; k<gigaflow_tables_limit; k++) {
+
+        /* perform Gigaflow lookup on the given missed_keys batch 
+           (missed from previous caches); we always perform lookup 
+           on all keys (including those with Gigaflow hits found) 
+           but execute actions only for the missed ones.
+           this will also internally clear subflow_rules before processing */
+        int n_subflow_gigaflow_hit = 0;
+        // dp_netdev_pmd_lookup_subflow_batch_in_gigaflow_cls(
+        //     (const struct netdev_flow_key **)clone_missed_keys, 
+        //     subflow_rules, k, cnt, &n_subflow_gigaflow_hit, cls);
+        dp_netdev_pmd_lookup_subflow_batch_in_gigaflow_cls_with_priorities(
+            (const struct netdev_flow_key **)clone_missed_keys, 
+            subflow_rules, k, cnt, &n_subflow_gigaflow_hit, cls);
+        
+        /* not a single gigaflow hit found? */
+        if (!n_subflow_gigaflow_hit) {
+            continue;
+        }
+        
+        /* perform actions in matched rule on each packet in this batch 
+           if hit is found, don't refill into batch; otherwise do */
+        DP_PACKET_BATCH_REFILL_FOR_EACH (i, cnt, clone_packet, clone_packets_) {
+            
+            /* if Gigaflow was already hit, no need to process further */ 
+            if (gigaflow_hits[i] == GIGAFLOW_HIT) {
+                /* always refill packet back to the beginning of the 
+                   clone_packet_ array. clone_missed_keys remain at same indices */
+                dp_packet_batch_refill(clone_packets_, clone_packet, i);
+                continue;
+            }
+
+            /* if no matching rule was found in Gigaflow 
+               we can't process any datapath actions */ 
+            if (!OVS_UNLIKELY(subflow_rules[i])) {
+                /* always refill packet back to the beginning of the 
+                   clone_packet_ array. clone_missed_keys remain at same indices */
+                dp_packet_batch_refill(clone_packets_, clone_packet, i);
+                continue;
+            }
+
+            // /* Input flow before applying the sub-traversal actions */
+            // /* extract new key and get updated flow */
+            // struct flow input_flow;
+            // dp_netdev_extract_key_from_packet(clone_packet, 
+            //                                   clone_missed_keys[i], md_is_valid);
+            // miniflow_expand(&clone_missed_keys[i]->mf, &input_flow);
+
+            /* execute subflow actions on this packet (no steal) */
+            struct dp_packet_batch single_packet_batch;
+            uint8_t matching_sub_traversal_table_id =
+                dp_netdev_execute_gigaflow_subflow_actions(pmd, &single_packet_batch, 
+                                                           subflow_rules[i], clone_packet, 
+                                                           false);
+
+            // // this should ALWAYS be zero
+            // uint8_t diff_1 = input_flow.nw_tos - matching_sub_traversal_table_id;
+
+            /* Output flow after applying the sub-traversal actions */
+            /* extract new key and get updated flow */
+            struct flow output_flow;
+            dp_netdev_extract_key_from_packet(clone_packet, 
+                                              clone_missed_keys[i], md_is_valid);
+            miniflow_expand(&clone_missed_keys[i]->mf, &output_flow);
+
+            /* check hit or miss from Gigaflow 
+               nw_tos should be populated with OUTPUT or DROP table ID */
+            uint8_t next_table_id = output_flow.nw_tos;
+
+            // // this should typically be non-zero if no resubmissions are there
+            // uint8_t diff_2 = next_table_id - input_flow.nw_tos;
+
+            if (next_table_id == OUTPUT_TABLE_ID || next_table_id == DROP_TABLE_ID) {
+                gigaflow_hits[i] = GIGAFLOW_HIT;
+            }
+            
+            /* cleanup the packet batch that we created 
+                we cannot delete the packet itself, so we can't call 
+                dp_packet_delete_batch() directly */ 
+            single_packet_batch.packets[0] = NULL;
+            dp_packet_batch_init(&single_packet_batch);
+            
+            /* always refill packet back to the beginning of the 
+               clone_packet_ array. clone_missed_keys remain at same indices */
+            dp_packet_batch_refill(clone_packets_, clone_packet, i);
+        }
+    }
+
+    /* process whether original packets found complete hits in Gigaflow 
+       if not, refill in packet batch for Megaflow lookup, otherwise, 
+       send packets to output */
+    DP_PACKET_BATCH_REFILL_FOR_EACH (i, cnt, packet, packets_) {
+
+        /* found hit  in the Gigaflow pipeline */ 
+        if (gigaflow_hits[i] == GIGAFLOW_HIT) {
+            /* remove packet from original batch */
+            dp_packet_delete(packet);
+            n_gigaflow_hit++;
+            continue;
+        }
+
+        /* Gigaflow missed. Group missed packets together at
+        * the beginning of the 'packets' array. */
+        dp_packet_batch_refill(packets_, packet, i);
+
+        /* Get the original order of this packet in received batch. */
+        recv_idx = index_map[i];
+
+        /* Preserve the order of packet for flow batching. */
+        index_map[n_missed] = recv_idx;
+
+        /* Put missed keys to the pointer arrays return to the caller */
+        missed_keys[n_missed++] = missed_keys[i];
+    }
+
+    /* free the cloned batch of packets */
+    dp_packet_delete_batch(&clone_packets_obj, true);
+
+    /* updata Gigaflow hit statistics */
+    gf_perf_update_counter(&pmd->gf_perf_stats, GF_STAT_HIT_COUNT, 
+                           n_gigaflow_hit);   
+}
+
+
 struct dp_netdev_flow *
 smc_lookup_single(struct dp_netdev_pmd_thread *pmd,
                   struct dp_packet *packet,
@@ -8108,17 +8686,29 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
     size_t map_cnt = 0;
     bool batch_enable = true;
 
-    const bool simple_match_enabled =
-        !md_is_valid && dp_netdev_simple_match_enabled(pmd, port_no);
-    /* 'simple_match_table' is a full flow table.  If the flow is not there,
-     * upcall is required, and there is no chance to find a match in caches. */
-    const bool smc_enable_db = !simple_match_enabled && pmd->ctx.smc_enable_db;
-    const uint32_t cur_min = simple_match_enabled
-                             ? 0 : pmd->ctx.emc_insert_min;
+    // const bool simple_match_enabled = 
+    //        !md_is_valid && dp_netdev_simple_match_enabled(pmd, port_no);
+    // /* 'simple_match_table' is a full flow table.  If the flow is not there,
+    //  * upcall is required, and there is no chance to find a match in caches. */
+    // const bool smc_enable_db = !simple_match_enabled && pmd->ctx.smc_enable_db;
+    // const uint32_t cur_min = simple_match_enabled
+    //                          ? 0 : pmd->ctx.emc_insert_min;
+
+    /* disable all caches (except Megaflow) for Gigaflow */
+    const bool simple_match_enabled = false;
+    const bool smc_enable_db = false;
+    const uint32_t cur_min = 0;
+
+    /* read Gigaflow enable flag */
+    const bool gigaflow_enabled = pmd->dp->gf_config->gigaflow_enabled;
+    const bool gigaflow_lookup_enabled = 
+        pmd->dp->gf_config->gigaflow_lookup_enabled;
 
     pmd_perf_update_counter(&pmd->perf_stats,
                             md_is_valid ? PMD_STAT_RECIRC : PMD_STAT_RECV,
                             cnt);
+    gf_perf_update_counter(&pmd->gf_perf_stats, GF_STAT_TOTAL_PACKETS, cnt);
+
     int i;
     DP_PACKET_BATCH_REFILL_FOR_EACH (i, cnt, packet, packets_) {
         struct dp_netdev_flow *flow = NULL;
@@ -8220,13 +8810,23 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
                             n_simple_hit);
     pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_EXACT_HIT, n_emc_hit);
 
-    if (!smc_enable_db) {
-        return dp_packet_batch_size(packets_);
+    if (smc_enable_db) {
+        /* Packets miss EMC will do a batch lookup in SMC if enabled */
+        smc_lookup_batch(pmd, keys, missed_keys, packets_,
+                         n_missed, flow_map, index_map);
     }
 
-    /* Packets miss EMC will do a batch lookup in SMC if enabled */
-    smc_lookup_batch(pmd, keys, missed_keys, packets_,
-                     n_missed, flow_map, index_map);
+#ifdef GIGAFLOW_CACHE_ENABLED
+    /* Gigaflow enabled only enables Gigaflow processing logic, mapper,
+       state update, and all that, but for software Gigaflow lookup,
+       we need gigaflow_lookup_enabled as well */
+    if (gigaflow_enabled && gigaflow_lookup_enabled) {
+        /* Packets miss smc, EMC, and SMC will do a batch lookup 
+           in Gigaflow if enabled */
+        gigaflow_lookup_batch(pmd, missed_keys, packets_,
+                              n_missed, index_map);
+    }
+#endif
 
     return dp_packet_batch_size(packets_);
 }
@@ -8241,6 +8841,20 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
     struct dp_packet_batch b;
     struct match match;
     ovs_u128 ufid;
+
+    /* read Gigaflow enable flag */
+    const bool gigaflow_enabled = pmd->dp->gf_config->gigaflow_enabled;
+
+    struct gigaflow_xlate_context gf_xlate_ctx;
+    struct gigaflow_mapping_context gf_map_ctx;
+    gigaflow_xlate_ctx_init(&gf_xlate_ctx);
+#ifdef GIGAFLOW_CACHE_ENABLED
+    if (gigaflow_enabled) {
+        gigaflow_mapping_ctx_init(&gf_map_ctx, &pmd->map_state, 
+                                  pmd->dp->gf_config);
+    }
+#endif
+
     int error;
     uint64_t cycles = cycles_counter_update(&pmd->perf_stats);
     odp_port_t orig_in_port = packet->md.orig_in_port;
@@ -8248,14 +8862,21 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
     match.tun_md.valid = false;
     miniflow_expand(&key->mf, &match.flow);
     memset(&match.wc, 0, sizeof match.wc);
+    match.table_id = 0;
 
     ofpbuf_clear(actions);
     ofpbuf_clear(put_actions);
 
     odp_flow_key_hash(&match.flow, sizeof match.flow, &ufid);
-    error = dp_netdev_upcall(pmd, packet, &match.flow, &match.wc,
-                             &ufid, DPIF_UC_MISS, NULL, actions,
+
+    uint64_t lookup_cycles = cycles_counter_update(&pmd->perf_stats);
+    error = dp_netdev_upcall(pmd, packet, &match.flow, &match.wc, &ufid, 
+                             &gf_xlate_ctx, DPIF_UC_MISS, NULL, actions,
                              put_actions);
+    lookup_cycles = cycles_counter_update(&pmd->perf_stats) - lookup_cycles;
+    gf_perf_update_counter(&pmd->gf_perf_stats, GF_STAT_LOOKUP_CYCLES, 
+                           lookup_cycles);
+    
     if (OVS_UNLIKELY(error && error != ENOSPC)) {
         dp_packet_delete(packet);
         COVERAGE_INC(datapath_drop_upcall_error);
@@ -8270,7 +8891,26 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
      * here.  This must be in sync with 'match' in dpif_netdev_flow_put(). */
     if (!match.wc.masks.vlans[0].tci) {
         match.wc.masks.vlans[0].tci = htons(VLAN_VID_MASK | VLAN_CFI);
+#ifdef GIGAFLOW_CACHE_ENABLED
+        if (gigaflow_enabled) {
+            for (int k=0; k<gf_xlate_ctx.tables_looked_up_in_upcall; k++) {
+                gf_xlate_ctx.individual_wcs[k].masks.vlans[0].tci = 
+                    htons(VLAN_VID_MASK | VLAN_CFI);
+            }
+        }
+#endif
     }
+
+#ifdef GIGAFLOW_CACHE_ENABLED
+    if (gigaflow_enabled) {
+        // map gigaflows to Gigaflow cache tables
+        uint64_t mapper_cycles = cycles_counter_update(&pmd->perf_stats);
+        map_traversal_to_gigaflow(&gf_xlate_ctx, &gf_map_ctx, 
+                                  &pmd->gf_perf_stats, &pmd->perf_stats);
+        mapper_cycles = cycles_counter_update(&pmd->perf_stats) - mapper_cycles;
+        gf_perf_update_counter(&pmd->gf_perf_stats, GF_STAT_MAP_CYCLES, mapper_cycles);
+    }
+#endif
 
     /* We can't allow the packet batching in the next loop to execute
      * the actions.  Otherwise, if there are any slow path actions,
@@ -8295,11 +8935,64 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
                                              add_actions->data,
                                              add_actions->size, orig_in_port);
         }
+#ifdef GIGAFLOW_CACHE_ENABLED
+        if (gigaflow_enabled) {
+            /* install Gigaflow entries here.. 
+            if a MISS was caught from Megaflow, we always 
+            try to install a Gigaflow set of entries */
+            uint64_t flow_setup_cycles = cycles_counter_update(&pmd->perf_stats);
+            dp_netdev_flow_add_gigaflow(pmd, &match, &ufid, &gf_map_ctx, orig_in_port);
+            flow_setup_cycles = cycles_counter_update(&pmd->perf_stats) - flow_setup_cycles;
+            gf_perf_update_counter(&pmd->gf_perf_stats, GF_STAT_FLOW_SETUP_CYCLES, 
+                                    flow_setup_cycles);
+
+            // const uint32_t optimize_paths = pmd->dp->gf_config->optimize_paths;
+            // if (optimize_paths) {
+            //     /* update Gigaflow state after mapping has been done 
+            //        update is only necessary if new Gigaflow rules are setup 
+            //        otherwise, no need to update the state */
+            //     uint64_t gf_state_up_cycles = cycles_counter_update(&pmd->perf_stats);
+            //     update_gigaflow_state_with_mapping(&gf_xlate_ctx, &gf_map_ctx);
+            //     const bool batch_updates = pmd->dp->gf_config->batch_state_updates;
+            //     /* per-upcall update of Gigaflow state paths; the cost of this update 
+            //     is included in the mapper and upcall cycles as well. This is very 
+            //     expensive, and should be avoided in favor of batched paths updates
+            //     as implemented in fast_path_processing() */
+            //     const uint32_t warmup_batches = pmd->dp->gf_config->warmup_batches;
+            //     uint32_t batches_processed = 
+            //         (uint32_t)pmd->gf_perf_stats.stats[GF_STAT_TOTAL_BATCHES];
+            //     /* if batch update is disabled OR if it's enabled but we are 
+            //     within the warmup batches, then update on a per-upcall basis */
+            //     if (!batch_updates || 
+            //         (batch_updates && (warmup_batches > 0)
+            //         && (batches_processed < warmup_batches))) {
+            //         update_gigaflow_state_paths(&pmd->map_state.gf_lm);
+            //     }
+            //     gf_state_up_cycles = cycles_counter_update(&pmd->perf_stats) - gf_state_up_cycles;
+            //     gf_perf_update_counter(&pmd->gf_perf_stats, GF_STAT_STATE_UPDATE_CYCLES, 
+            //                             gf_state_up_cycles);
+            //     /* cost of state update is part of mapping 
+            //        call only if it's not internally updating the state! */ 
+            //     gf_perf_update_counter(&pmd->gf_perf_stats, GF_STAT_MAP_CYCLES, 
+            //                             gf_state_up_cycles);
+            // }
+        }
+#endif
         ovs_mutex_unlock(&pmd->flow_mutex);
         uint32_t hash = dp_netdev_flow_hash(&netdev_flow->ufid);
         smc_insert(pmd, key, hash);
         emc_probabilistic_insert(pmd, key, netdev_flow);
     }
+
+#ifdef GIGAFLOW_CACHE_ENABLED
+    if (gigaflow_enabled) {
+        /* cleanup mapping context */
+        gigaflow_mapping_ctx_uninit(&gf_map_ctx);
+    }
+#endif
+
+    /* this should be called at the end of all upcall operation
+       in order to accurately estimate the number of cycles spent on it */
     if (pmd_perf_metrics_enabled(pmd)) {
         /* Update upcall stats. */
         cycles = cycles_counter_update(&pmd->perf_stats) - cycles;
@@ -8307,6 +9000,13 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
         s->current.upcalls++;
         s->current.upcall_cycles += cycles;
         histogram_add_sample(&s->cycles_per_upcall, cycles);
+        /* (patch) if pmd core is not assigned (kernel mode) manually 
+           add to upcall cycles here */
+        if (pmd->core_id == NON_PMD_CORE_ID) {
+            s->counters.n[PMD_CYCLES_UPCALL] += cycles;
+        }
+        gf_perf_update_counter(&pmd->gf_perf_stats, GF_STAT_UPCALL_CYCLES, 
+                               cycles);
     }
     return error;
 }
@@ -8426,6 +9126,46 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
                             upcall_ok_cnt);
     pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_LOST,
                             upcall_fail_cnt);
+    /* update upcalls statistics in gigaflow stats */
+    gf_perf_update_counter(&pmd->gf_perf_stats, GF_STAT_UPCALLS, 
+                            upcall_ok_cnt);
+    
+#ifdef GIGAFLOW_CACHE_ENABLED
+    /* read Gigaflow enable flag */
+    // const bool gigaflow_enabled = pmd->dp->gf_config->gigaflow_enabled;
+    // if (gigaflow_enabled) {
+
+    //     const bool batch_updates = pmd->dp->gf_config->batch_state_updates;
+    //     const uint32_t warmup_batches = pmd->dp->gf_config->warmup_batches;
+    //     const uint32_t batch_update_interval = pmd->dp->gf_config->batch_update_interval;
+
+    //     /* batch update of Gigaflow state paths; the cost of this update 
+    //         is including in the mapper and upcall cycles as well */
+    //     uint32_t batches_processed = 
+    //         (uint32_t)pmd->gf_perf_stats.stats[GF_STAT_TOTAL_BATCHES];
+
+    //     if (batch_updates) {
+    //         /* warmup batches are handled in handle_packet_upcall
+    //            here, we update Gigaflow state on a batch-to-batch basis
+    //            after the warmup period */
+    //         if (warmup_batches == 0 || (batches_processed > warmup_batches)) {
+    //             if ((batches_processed % batch_update_interval) == 0) {
+    //                 uint64_t gf_state_up_cycles = cycles_counter_update(&pmd->perf_stats);
+    //                 update_gigaflow_state_paths(&pmd->map_state.gf_lm);
+    //                 gf_state_up_cycles = cycles_counter_update(&pmd->perf_stats) - 
+    //                     gf_state_up_cycles;
+    //                 gf_perf_update_counter(&pmd->gf_perf_stats, 
+    //                                        GF_STAT_STATE_BATCH_UPDATE_CYCLES, 
+    //                                        gf_state_up_cycles);
+    //                 gf_perf_update_counter(&pmd->gf_perf_stats, 
+    //                                        GF_STAT_TOTAL_BATCH_UPDATES, 1);
+    //             }
+    //         }
+    //     }
+    //     /* update how many packet batches have been processed */
+    //     gf_perf_update_counter(&pmd->gf_perf_stats, GF_STAT_TOTAL_BATCHES, 1);
+    // }
+#endif
 }
 
 /* Packets enter the datapath from a port (or from recirculation) here.
@@ -8492,6 +9232,9 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
     for (i = 0; i < n_batches; i++) {
         packet_batch_per_flow_execute(&batches[i], pmd);
     }
+
+    /* update Gigaflow statistics after full-stack batch processing */
+    gf_perf_update_stats(&pmd->gf_perf_stats, pmd->dp->gf_config);
 }
 
 int32_t
@@ -8649,11 +9392,14 @@ dp_execute_userspace_action(struct dp_netdev_pmd_thread *pmd,
     struct dp_packet_batch b;
     int error;
 
+    struct gigaflow_xlate_context gf_xlate_ctx;
+    gigaflow_xlate_ctx_init(&gf_xlate_ctx);
+
     ofpbuf_clear(actions);
 
-    error = dp_netdev_upcall(pmd, packet, flow, NULL, ufid,
-                             DPIF_UC_ACTION, userdata, actions,
-                             NULL);
+    error = dp_netdev_upcall(pmd, packet, flow, NULL, ufid, &gf_xlate_ctx, 
+                             DPIF_UC_ACTION, userdata, actions, NULL);
+
     if (!error || error == ENOSPC) {
         dp_packet_batch_init_packet(&b, packet);
         dp_netdev_execute_actions(pmd, &b, should_steal, flow,

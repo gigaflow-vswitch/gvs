@@ -1,0 +1,8 @@
+1. In Makefile.am, we have commented out the following checks:
+ - ALL_LOCAL += check-endian (SDNet Endianess variables created issue with OVS vars)
+ - ALL_LOCAL += dist-hook-git (our SDNet headers are not in the git distro of OVS)
+2. In Makefile.am, we didn't remove the following check:
+ - ALL_LOCAL += thread-safety-check
+ but instead we removed the thread-unsafe operations from sdnet_nfp_env.c
+  - all fprintf()s have been removed
+3. #include <config.h> was added to sdnet_nfp_env.c as OVS requires in each source file

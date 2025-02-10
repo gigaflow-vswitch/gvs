@@ -45,6 +45,8 @@
 #include "openvswitch/vlog.h"
 #include "lib/netdev-provider.h"
 
+#include "mapper.h"
+
 #define UPCALL_MAX_BATCH 64
 #define REVALIDATE_MAX_BATCH 50
 
@@ -230,6 +232,9 @@ struct upcall {
     struct flow_wildcards wc;      /* Dependencies that megaflow must match. */
     struct ofpbuf put_actions;     /* Actions 'put' in the fastpath. */
 
+    /* gigaflow translation context required for Gigaflow mapping */
+    struct gigaflow_xlate_context *gf_xlate_ctx;
+
     struct dpif_ipfix *ipfix;      /* IPFIX pointer or NULL. */
     struct dpif_sflow *sflow;      /* SFlow pointer or NULL. */
 
@@ -393,12 +398,12 @@ static void put_op_init(struct ukey_op *op, struct udpif_key *ukey,
                         enum dpif_flow_put_flags flags);
 static void delete_op_init(struct udpif *udpif, struct ukey_op *op,
                            struct udpif_key *ukey);
-
 static int upcall_receive(struct upcall *, const struct dpif_backer *,
                           const struct dp_packet *packet, enum dpif_upcall_type,
                           const struct nlattr *userdata, const struct flow *,
-                          const unsigned int mru,
-                          const ovs_u128 *ufid, const unsigned pmd_id);
+                          struct gigaflow_xlate_context *gf_xlate_ctx,
+                          const unsigned int mru, const ovs_u128 *ufid, 
+                          const unsigned pmd_id);
 static void upcall_uninit(struct upcall *);
 
 static void udpif_flow_rebalance(struct udpif *udpif);
@@ -844,8 +849,9 @@ recv_upcalls(struct handler *handler)
         }
 
         error = upcall_receive(upcall, udpif->backer, &dupcall->packet,
-                               dupcall->type, dupcall->userdata, flow, mru,
-                               &dupcall->ufid, PMD_ID_NULL);
+                               dupcall->type, dupcall->userdata, flow, 
+                               NULL, mru, &dupcall->ufid, PMD_ID_NULL);
+
         if (error) {
             if (error == ENODEV) {
                 /* Received packet on datapath port for which we couldn't
@@ -1142,7 +1148,7 @@ static int
 upcall_receive(struct upcall *upcall, const struct dpif_backer *backer,
                const struct dp_packet *packet, enum dpif_upcall_type type,
                const struct nlattr *userdata, const struct flow *flow,
-               const unsigned int mru,
+               struct gigaflow_xlate_context *gf_xlate_ctx, const unsigned int mru, 
                const ovs_u128 *ufid, const unsigned pmd_id)
 {
     int error;
@@ -1179,6 +1185,8 @@ upcall_receive(struct upcall *upcall, const struct dpif_backer *backer,
                     sizeof upcall->odp_actions_stub);
     ofpbuf_init(&upcall->put_actions, 0);
 
+    upcall->gf_xlate_ctx = gf_xlate_ctx;
+
     upcall->xout_initialized = false;
     upcall->ukey_persists = false;
 
@@ -1200,7 +1208,7 @@ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
     struct dpif_flow_stats stats;
     enum xlate_error xerr;
     struct xlate_in xin;
-    struct ds output;
+    // struct ds output;
 
     stats.n_packets = 1;
     stats.n_bytes = dp_packet_size(upcall->packet);
@@ -1211,6 +1219,8 @@ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
                   ofproto_dpif_get_tables_version(upcall->ofproto),
                   upcall->flow, upcall->ofp_in_port, NULL,
                   stats.tcp_flags, upcall->packet, wc, odp_actions);
+
+    xin.gf_xlate_ctx = upcall->gf_xlate_ctx;
 
     if (upcall->type == MISS_UPCALL) {
         xin.resubmit_stats = &stats;
@@ -1235,6 +1245,8 @@ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
     upcall->reval_seq = seq_read(udpif->reval_seq);
 
     xerr = xlate_actions(&xin, &upcall->xout);
+    /* save xlate_error for later use in Gigaflow */
+    upcall->gf_xlate_ctx->xlate_error = xerr;
 
     /* Translate again and log the ofproto trace for
      * these two error types. */
@@ -1244,11 +1256,14 @@ upcall_xlate(struct udpif *udpif, struct upcall *upcall,
 
         /* This is a huge log, so be conservative. */
         if (!VLOG_DROP_WARN(&rll)) {
-            ds_init(&output);
-            ofproto_trace(upcall->ofproto, upcall->flow,
-                          upcall->packet, NULL, 0, NULL, &output);
-            VLOG_WARN("%s", ds_cstr(&output));
-            ds_destroy(&output);
+            /* Gigaflow is throwing error on this, so we are commenting this out */
+            // ds_init(&output);
+            // ofproto_trace(upcall->ofproto, upcall->flow,
+            //               upcall->packet, NULL, 0, NULL, &output);
+            // VLOG_WARN("%s", ds_cstr(&output));
+            // ds_destroy(&output);
+
+            VLOG_WARN("Upcall Error: XLATE_RECURSION_TOO_DEEP or XLATE_TOO_MANY_RESUBMITS");
         }
     }
 
@@ -1336,10 +1351,11 @@ should_install_flow(struct udpif *udpif, struct upcall *upcall)
 }
 
 static int
-upcall_cb(const struct dp_packet *packet, const struct flow *flow, ovs_u128 *ufid,
-          unsigned pmd_id, enum dpif_upcall_type type,
+upcall_cb(const struct dp_packet *packet, const struct flow *flow, 
+          ovs_u128 *ufid, unsigned pmd_id, enum dpif_upcall_type type,
           const struct nlattr *userdata, struct ofpbuf *actions,
-          struct flow_wildcards *wc, struct ofpbuf *put_actions, void *aux)
+          struct flow_wildcards *wc, struct gigaflow_xlate_context *gf_xlate_ctx, 
+          struct ofpbuf *put_actions, void *aux)
 {
     struct udpif *udpif = aux;
     struct upcall upcall;
@@ -1349,7 +1365,8 @@ upcall_cb(const struct dp_packet *packet, const struct flow *flow, ovs_u128 *ufi
     atomic_read_relaxed(&enable_megaflows, &megaflow);
 
     error = upcall_receive(&upcall, udpif->backer, packet, type, userdata,
-                           flow, 0, ufid, pmd_id);
+                           flow, gf_xlate_ctx, 0, ufid, pmd_id);
+
     if (error) {
         return error;
     }
@@ -2138,6 +2155,10 @@ xlate_key(struct udpif *udpif, const struct nlattr *key, unsigned int len,
     enum odp_key_fitness fitness;
     struct xlate_in xin;
     int error;
+
+    struct gigaflow_xlate_context gf_xlate_ctx;
+    gigaflow_xlate_ctx_init(&gf_xlate_ctx);
+    xin.gf_xlate_ctx = &gf_xlate_ctx;
 
     fitness = odp_flow_key_to_flow(key, len, &ctx->flow, NULL);
     if (fitness == ODP_FIT_ERROR) {

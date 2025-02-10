@@ -143,6 +143,10 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/fatal-signal.h \
 	lib/flow.c \
 	lib/flow.h \
+	lib/gigaflow-config.c \
+	lib/gigaflow-config.h \
+	lib/gigaflow-perf.c \
+	lib/gigaflow-perf.h \
 	lib/guarded-list.c \
 	lib/guarded-list.h \
 	lib/hash.c \
@@ -177,6 +181,8 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/lockfile.h \
 	lib/mac-learning.c \
 	lib/mac-learning.h \
+	lib/mapper.c \
+	lib/mapper.h \
 	lib/match.c \
 	lib/mcast-snooping.c \
 	lib/mcast-snooping.h \
@@ -186,6 +192,8 @@ lib_libopenvswitch_la_SOURCES = \
 	lib/mov-avg.h \
 	lib/mpsc-queue.c \
 	lib/mpsc-queue.h \
+	lib/multigraph.c \
+	lib/multigraph.h \
 	lib/multipath.c \
 	lib/multipath.h \
 	lib/namemap.c \

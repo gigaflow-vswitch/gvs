@@ -59,6 +59,8 @@ VLOG_DEFINE_THIS_MODULE(netdev_offload);
 
 
 static bool netdev_flow_api_enabled = false;
+static bool netdev_p4sdnet_flow_api_enabled = false;
+static bool netdev_p4sdnet_flow_api_is_initialized = false;
 
 #define DEFAULT_OFFLOAD_THREAD_NB 1
 #define MAX_OFFLOAD_THREAD_NB 10
@@ -320,10 +322,15 @@ netdev_init_flow_api(struct netdev *netdev)
         return 0;
     }
 
+    /* unregister linux_tc if already registered before SDNet */
+    if (netdev_p4sdnet_is_flow_api_enabled()) {
+        netdev_unregister_flow_api_provider(netdev_offload_tc.type);
+        netdev_register_flow_api_provider(&netdev_offload_dpdk_p4sdnet);
+    }
+
     if (netdev_assign_flow_api(netdev)) {
         return EOPNOTSUPP;
     }
-
     return 0;
 }
 
@@ -452,6 +459,18 @@ bool
 netdev_is_flow_api_enabled(void)
 {
     return netdev_flow_api_enabled;
+}
+
+bool
+netdev_p4sdnet_is_flow_api_enabled(void)
+{
+    return netdev_p4sdnet_flow_api_enabled;
+}
+
+bool
+netdev_p4sdnet_is_flow_api_initialized(void)
+{
+    return netdev_p4sdnet_flow_api_is_initialized;
 }
 
 unsigned int
@@ -785,6 +804,7 @@ netdev_set_flow_api_enabled(const struct smap *ovs_other_config)
 
         if (ovsthread_once_start(&once)) {
             netdev_flow_api_enabled = true;
+            netdev_p4sdnet_set_flow_api_enabled(ovs_other_config);
 
             offload_thread_nb = smap_get_ullong(ovs_other_config,
                                                 "n-offload-threads",
@@ -817,4 +837,25 @@ netdev_set_flow_api_enabled(const struct smap *ovs_other_config)
             ovsthread_once_done(&once);
         }
     }
+}
+
+void
+netdev_p4sdnet_set_flow_api_enabled(const struct smap *ovs_other_config)
+{
+    if (smap_get_bool(ovs_other_config, 
+                      "hw-offload-p4sdnet", false)) {
+        netdev_p4sdnet_flow_api_enabled = true;
+    }
+}
+
+void
+netdev_p4sdnet_set_flow_api_initialized(void)
+{
+    netdev_p4sdnet_flow_api_is_initialized = true;
+}
+
+void
+netdev_p4sdnet_set_flow_api_uninitialized(void)
+{
+    netdev_p4sdnet_flow_api_is_initialized = false;
 }

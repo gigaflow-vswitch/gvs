@@ -385,6 +385,8 @@
 #include "packets.h"
 #include "util.h"
 
+#include "mapper.h"
+
 #ifdef  __cplusplus
 extern "C" {
 #endif
@@ -877,6 +879,7 @@ typedef int upcall_callback(const struct dp_packet *packet,
                             const struct nlattr *userdata,
                             struct ofpbuf *actions,
                             struct flow_wildcards *wc,
+                            struct gigaflow_xlate_context *gf_xlate_ctx, 
                             struct ofpbuf *put_actions,
                             void *aux);
 

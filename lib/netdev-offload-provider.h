@@ -112,6 +112,7 @@ extern const struct netdev_flow_api netdev_offload_tc;
 
 #ifdef DPDK_NETDEV
 extern const struct netdev_flow_api netdev_offload_dpdk;
+extern const struct netdev_flow_api netdev_offload_dpdk_p4sdnet;
 #endif
 
 #ifdef  __cplusplus

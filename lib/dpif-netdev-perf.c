@@ -208,6 +208,8 @@ pmd_perf_stats_init(struct pmd_perf_stats *s)
 
 void
 pmd_perf_format_overall_stats(struct ds *str, struct pmd_perf_stats *s,
+                              struct gigaflow_perf_stats *gf_s,
+                              struct gigaflow_config *gf_config, 
                               double duration)
 {
     uint64_t stats[PMD_N_STATS];
@@ -277,6 +279,10 @@ pmd_perf_format_overall_stats(struct ds *str, struct pmd_perf_stats *s,
             upcalls ? (upcall_cycles * us_per_cycle) / upcalls : 0,
             stats[PMD_STAT_LOST],
             100.0 * stats[PMD_STAT_LOST] / passes);
+
+        // show Gigaflow performance statistics
+        gf_perf_show_pmd_perf(str, gf_s, gf_config);
+
     } else {
         ds_put_format(str,
             "  Rx packets:         %12d\n", 0);
@@ -479,8 +485,11 @@ pmd_perf_stats_clear_lock(struct pmd_perf_stats *s)
 /* This function can be called from the anywhere to clear the stats
  * of PMD and non-PMD threads. */
 void
-pmd_perf_stats_clear(struct pmd_perf_stats *s)
+pmd_perf_stats_clear(struct pmd_perf_stats *s, struct gigaflow_perf_stats *gf_s)
 {
+    /* clear Gigaflow rx/hit statistics */
+    gf_perf_stats_clear(gf_s);
+    
     if (ovs_mutex_trylock(&s->stats_mutex) == 0) {
         /* Locking successful. PMD not polling. */
         pmd_perf_stats_clear_lock(s);

@@ -519,7 +519,12 @@ dpdk_init__(const struct smap *ovs_other_config)
 
     /* Finally, register the dpdk classes */
     netdev_dpdk_register();
-    netdev_register_flow_api_provider(&netdev_offload_dpdk);
+    // netdev_register_flow_api_provider(&netdev_offload_dpdk);  // annus
+    if (netdev_p4sdnet_is_flow_api_enabled()) {
+        netdev_register_flow_api_provider(&netdev_offload_dpdk_p4sdnet);
+    } else {
+        netdev_register_flow_api_provider(&netdev_offload_dpdk);
+    }
     return true;
 }
 

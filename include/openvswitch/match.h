@@ -41,6 +41,9 @@ struct match {
     struct flow flow;
     struct flow_wildcards wc;
     struct tun_metadata_allocation tun_md;
+    /* Gigaflow parameters */
+    uint32_t gf_priority;
+    uint32_t table_id;
 };
 
 /* Initializer for a "struct match" that matches every packet. */

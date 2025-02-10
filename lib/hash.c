@@ -25,6 +25,35 @@ hash_3words(uint32_t a, uint32_t b, uint32_t c)
     return hash_finish(hash_add(hash_add(hash_add(a, 0), b), c), 12);
 }
 
+uint32_t hash_4words(uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+{
+    return hash_finish(hash_add(hash_add(hash_add(hash_add(a, 0), b), c), d), 12);
+}
+
+uint32_t hash_uint64_plus1(const uint64_t x)
+{
+    // hash_uint64 with +1 on word
+    return hash_uint64(x+1);
+}
+
+uint32_t hash_2words_plus1(uint32_t a, uint32_t b)
+{
+    // hash_2words with +1 on each word
+    return hash_2words(a+1, b+1);
+}
+
+uint32_t hash_3words_plus1(uint32_t a, uint32_t b, uint32_t c)
+{
+    // hash_3words with +1 on each word
+    return hash_3words(a+1, b+1, c+1);
+}
+
+uint32_t hash_4words_plus1(uint32_t a, uint32_t b, uint32_t c, uint32_t d)
+{
+    // hash_4words with +1 on each word
+    return hash_4words(a+1, b+1, c+1, d+1);
+}
+
 /* Returns the hash of the 'n' bytes at 'p', starting from 'basis'. */
 uint32_t
 hash_bytes(const void *p_, size_t n, uint32_t basis)

@@ -66,6 +66,7 @@
 #include "tunnel.h"
 #include "util.h"
 #include "uuid.h"
+#include "mapper.h"
 
 COVERAGE_DEFINE(xlate_actions);
 COVERAGE_DEFINE(xlate_actions_oversize);
@@ -200,6 +201,9 @@ struct xlate_ctx {
 
     /* Flow at the last commit. */
     struct flow base_flow;
+
+    /* a copy of the flow before visiting the next table (resubmit, goto) */
+    struct flow prev_flow;
 
     /* Tunnel IP destination address as received.  This is stored separately
      * as the base_flow.tunnel is cleared on init to reflect the datapath
@@ -4463,13 +4467,27 @@ xlate_table_action(struct xlate_ctx *ctx, ofp_port_t in_port, uint8_t table_id,
             }
             tuple_swap(&ctx->xin->flow, ctx->wc);
         }
+        
+        // save flow before this table lookup
+        gigaflow_xlate_ctx_insert_current_flow(ctx->xin->gf_xlate_ctx, ctx->xin->flow);
+        // send an invidual table wildcard for table lookup
         rule = rule_dpif_lookup_from_table(ctx->xbridge->ofproto,
                                            ctx->xin->tables_version,
-                                           &ctx->xin->flow, ctx->wc,
+                                           &ctx->xin->flow, 
+                                           gigaflow_xlate_ctx_get_current_wildcard(ctx->xin->gf_xlate_ctx),
                                            ctx->xin->resubmit_stats,
                                            &ctx->table_id, in_port,
                                            may_packet_in, honor_table_miss,
                                            ctx->xin->xcache);
+        // save this table's ID
+        gigaflow_xlate_ctx_insert_current_table_id(ctx->xin->gf_xlate_ctx, ctx->table_id);
+        // update the Megaflow wildcard using this table's wildcard
+        gigaflow_xlate_ctx_update_megaflow_wildcard(ctx->xin->gf_xlate_ctx, ctx->wc);
+        // move to next gigaflow context slot
+        gigaflow_xlate_ctx_increment_lookedup_tables_cnt(ctx->xin->gf_xlate_ctx);
+
+        /* ####################### Slow Path Accelerator ####################### */
+        
         /* Swap back. */
         if (with_ct_orig) {
             tuple_swap(&ctx->xin->flow, ctx->wc);
@@ -6896,6 +6914,9 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
     struct flow *flow = &ctx->xin->flow;
     const struct ofpact *a;
 
+    /* point the current table's wildcard */ 
+    struct flow_wildcards *current_wildcard = gigaflow_xlate_ctx_get_prev_wildcard(ctx->xin->gf_xlate_ctx);
+
     /* dl_type already in the mask, not set below. */
 
     if (!ofpacts_len) {
@@ -6935,12 +6956,34 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             xlate_report(ctx, OFT_ACTION, "%s", ds_cstr(&s));
             ds_destroy(&s);
         }
+        
+        ofp_port_t output_openflow_port;
 
         switch (a->type) {
         case OFPACT_OUTPUT:
-            xlate_output_action(ctx, ofpact_get_OUTPUT(a)->port,
-                                ofpact_get_OUTPUT(a)->max_len, true, last,
-                                false, group_bucket_action);
+            /* update the previous table's base flow */ 
+            ctx->prev_flow = *flow;
+
+            /* store the output port
+               make sure we don't send the packet back to the input port */ 
+            output_openflow_port = ofpact_get_OUTPUT(a)->port;
+
+            if (output_openflow_port != ctx->xin->flow.in_port.ofp_port) {
+                /* the output action needs to be explicitly added to our current actions */ 
+                const struct xport *xport = get_ofp_port(ctx->xbridge, output_openflow_port);
+                gigaflow_xlate_ctx_set_output_odp_port(ctx->xin->gf_xlate_ctx, xport->odp_port);
+            }
+            
+            xlate_output_action(ctx, output_openflow_port,
+                                 ofpact_get_OUTPUT(a)->max_len, true, last,
+                                 false, group_bucket_action);
+
+            /* copy the final (output) flow representation at the table index tables_looked_up */ 
+            gigaflow_xlate_ctx_insert_current_flow(ctx->xin->gf_xlate_ctx, ctx->xin->flow);
+
+            /* save the output table ID in table traversal as well for mapper */
+            gigaflow_xlate_ctx_insert_current_table_id(ctx->xin->gf_xlate_ctx, OUTPUT_TABLE_ID);
+            
             break;
 
         case OFPACT_GROUP:
@@ -7027,6 +7070,8 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
         case OFPACT_SET_IPV4_SRC:
             if (flow->dl_type == htons(ETH_TYPE_IP)) {
                 memset(&wc->masks.nw_src, 0xff, sizeof wc->masks.nw_src);
+                /* update the wildcard */ 
+                memset(&current_wildcard->masks.nw_src, 0xff, sizeof current_wildcard->masks.nw_src);
                 flow->nw_src = ofpact_get_SET_IPV4_SRC(a)->ipv4;
             }
             break;
@@ -7034,6 +7079,8 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
         case OFPACT_SET_IPV4_DST:
             if (flow->dl_type == htons(ETH_TYPE_IP)) {
                 memset(&wc->masks.nw_dst, 0xff, sizeof wc->masks.nw_dst);
+                /* update the wildcard */ 
+                memset(&current_wildcard->masks.nw_dst, 0xff, sizeof current_wildcard->masks.nw_dst);
                 flow->nw_dst = ofpact_get_SET_IPV4_DST(a)->ipv4;
             }
             break;
@@ -7065,6 +7112,9 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             if (is_ip_any(flow) && !(flow->nw_frag & FLOW_NW_FRAG_LATER)) {
                 memset(&wc->masks.nw_proto, 0xff, sizeof wc->masks.nw_proto);
                 memset(&wc->masks.tp_src, 0xff, sizeof wc->masks.tp_src);
+                /* update the wildcard */
+                memset(&current_wildcard->masks.nw_proto, 0xff, sizeof current_wildcard->masks.nw_proto);
+                memset(&current_wildcard->masks.tp_src, 0xff, sizeof current_wildcard->masks.tp_src);
                 flow->tp_src = htons(ofpact_get_SET_L4_SRC_PORT(a)->port);
             }
             break;
@@ -7073,6 +7123,9 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
             if (is_ip_any(flow) && !(flow->nw_frag & FLOW_NW_FRAG_LATER)) {
                 memset(&wc->masks.nw_proto, 0xff, sizeof wc->masks.nw_proto);
                 memset(&wc->masks.tp_dst, 0xff, sizeof wc->masks.tp_dst);
+                /* update the wildcard */ 
+                memset(&current_wildcard->masks.nw_proto, 0xff, sizeof current_wildcard->masks.nw_proto);
+                memset(&current_wildcard->masks.tp_dst, 0xff, sizeof current_wildcard->masks.tp_dst);
                 flow->tp_dst = htons(ofpact_get_SET_L4_DST_PORT(a)->port);
             }
             break;
@@ -7085,6 +7138,8 @@ do_xlate_actions(const struct ofpact *ofpacts, size_t ofpacts_len,
          * resubmit to the frozen actions.
          */
         case OFPACT_RESUBMIT:
+            /* update the previous table's base flow */
+            ctx->prev_flow = *flow;
             xlate_ofpact_resubmit(ctx, ofpact_get_RESUBMIT(a), last);
             continue;
         case OFPACT_GOTO_TABLE:
@@ -7537,6 +7592,32 @@ xlate_wc_init(struct xlate_ctx *ctx)
     }
 
     tnl_wc_init(&ctx->xin->flow, ctx->wc);
+
+    /* do the above initialization for all the individual wildcards */ 
+    struct flow_wildcards *individual_wildcards = ctx->xin->gf_xlate_ctx->individual_wcs;
+    for (int i=0; i<SLOW_PATH_TRAVERSAL_LIMIT; i++) {
+        flow_wildcards_init_catchall(&individual_wildcards[i]);
+
+        /* Some fields we consider to always be examined. */
+        WC_MASK_FIELD(&individual_wildcards[i], packet_type);
+        WC_MASK_FIELD(&individual_wildcards[i], in_port);
+        WC_MASK_FIELD(&individual_wildcards[i], dl_type);
+        if (is_ip_any(&ctx->xin->flow)) {
+            WC_MASK_FIELD_MASK(&individual_wildcards[i], nw_frag, FLOW_NW_FRAG_MASK);
+        }
+
+        if (ctx->xbridge->support.odp.recirc) {
+            /* Always exactly match recirc_id when datapath supports
+            * recirculation.  */
+            WC_MASK_FIELD(&individual_wildcards[i], recirc_id);
+        }
+
+        if (ctx->xbridge->netflow) {
+            netflow_mask_wc(&ctx->xin->flow, &individual_wildcards[i]);
+        }
+
+        tnl_wc_init(&ctx->xin->flow, &individual_wildcards[i]);
+    }
 }
 
 static void
@@ -7609,6 +7690,80 @@ xlate_wc_finish(struct xlate_ctx *ctx)
             ctx->wc->masks.vlans[i].tci = 0;
         }
     }
+
+    struct flow_wildcards *individual_wildcards = ctx->xin->gf_xlate_ctx->individual_wcs;
+
+    /* Run the above code on individual wildcards as well */ 
+    for (int k=0; k<gigaflow_xlate_ctx_get_lookedup_tables_cnt(ctx->xin->gf_xlate_ctx); k++) {
+
+        /* Clear the metadata and register wildcard masks, because we won't
+        * use non-header fields as part of the cache. */
+        flow_wildcards_clear_non_packet_fields(&individual_wildcards[k]);
+
+        /* Wildcard Ethernet address fields if the original packet type was not
+        * Ethernet.
+        *
+        * (The Ethertype field is used even when the original packet type is not
+        * Ethernet.) */
+        if (ctx->xin->upcall_flow->packet_type != htonl(PT_ETH)) {
+            individual_wildcards[k].masks.dl_dst = eth_addr_zero;
+            individual_wildcards[k].masks.dl_src = eth_addr_zero;
+        }
+
+        /* ICMPv4 and ICMPv6 have 8-bit "type" and "code" fields.  struct flow
+        * uses the low 8 bits of the 16-bit tp_src and tp_dst members to
+        * represent these fields.  The datapath interface, on the other hand,
+        * represents them with just 8 bits each.  This means that if the high
+        * 8 bits of the masks for these fields somehow become set, then they
+        * will get chopped off by a round trip through the datapath, and
+        * revalidation will spot that as an inconsistency and delete the flow.
+        * Avoid the problem here by making sure that only the low 8 bits of
+        * either field can be unwildcarded for ICMP.
+        */
+        if (is_icmpv4(&ctx->xin->flow, NULL) || is_icmpv6(&ctx->xin->flow, NULL)) {
+            individual_wildcards[k].masks.tp_src &= htons(UINT8_MAX);
+            individual_wildcards[k].masks.tp_dst &= htons(UINT8_MAX);
+        }
+        /* VLAN_TCI CFI bit must be matched if any of the TCI is matched. */
+        for (i = 0; i < FLOW_MAX_VLAN_HEADERS; i++) {
+            if (individual_wildcards[k].masks.vlans[i].tci) {
+                individual_wildcards[k].masks.vlans[i].tci |= htons(VLAN_CFI);
+            }
+        }
+
+        /* The classifier might return masks that match on tp_src and tp_dst even
+        * for later fragments.  This happens because there might be flows that
+        * match on tp_src or tp_dst without matching on the frag bits, because
+        * it is not a prerequisite for OpenFlow.  Since it is a prerequisite for
+        * datapath flows and since tp_src and tp_dst are always going to be 0,
+        * wildcard the fields here. */
+        if (ctx->xin->flow.nw_frag & FLOW_NW_FRAG_LATER) {
+            individual_wildcards[k].masks.tp_src = 0;
+            individual_wildcards[k].masks.tp_dst = 0;
+        }
+
+        /* Clear flow wildcard bits for fields which are not present
+        * in the original packet header. These wildcards may get set
+        * due to push/set_field actions. This results into frequent
+        * invalidation of datapath flows by revalidator thread. */
+
+        /* Clear mpls label wc bits if original packet is non-mpls. */
+        if (!eth_type_mpls(ctx->xin->upcall_flow->dl_type)) {
+            for (i = 0; i < FLOW_MAX_MPLS_LABELS; i++) {
+                individual_wildcards[k].masks.mpls_lse[i] = 0;
+            }
+        }
+        
+        /* Clear vlan header wc bits if original packet does not have
+        * vlan header. */
+        for (i = 0; i < FLOW_MAX_VLAN_HEADERS; i++) {
+            if (!eth_type_vlan(ctx->xin->upcall_flow->vlans[i].tpid)) {
+                individual_wildcards[k].masks.vlans[i].tpid = 0;
+                individual_wildcards[k].masks.vlans[i].tci = 0;
+            }
+        }
+
+    }
 }
 
 /* Translates the flow, actions, or rule in 'xin' into datapath actions in
@@ -7644,6 +7799,7 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
         .xin = xin,
         .xout = xout,
         .base_flow = *flow,
+        .prev_flow = *flow,
         .orig_tunnel_ipv6_dst = flow_tnl_dst(&flow->tunnel),
         .xcfg = xcfg,
         .xbridge = xbridge,
@@ -7827,10 +7983,21 @@ xlate_actions(struct xlate_in *xin, struct xlate_out *xout)
     }
 
     if (!xin->ofpacts && !ctx.rule) {
+        /* save flow before this table lookup */ 
+        gigaflow_xlate_ctx_insert_current_flow(ctx.xin->gf_xlate_ctx, ctx.xin->flow);
+        /* send an invidual table wildcard for table lookup */
         ctx.rule = rule_dpif_lookup_from_table(
-            ctx.xbridge->ofproto, ctx.xin->tables_version, flow, ctx.wc,
+            ctx.xbridge->ofproto, ctx.xin->tables_version, flow, 
+            gigaflow_xlate_ctx_get_current_wildcard(ctx.xin->gf_xlate_ctx),
             ctx.xin->resubmit_stats, &ctx.table_id,
             flow->in_port.ofp_port, true, true, ctx.xin->xcache);
+        /* save this table's ID */
+        gigaflow_xlate_ctx_insert_current_table_id(ctx.xin->gf_xlate_ctx, ctx.table_id);
+        /* update the Megaflow wildcard using this table's wildcard */
+        gigaflow_xlate_ctx_update_megaflow_wildcard(ctx.xin->gf_xlate_ctx, ctx.wc);
+        /* move to next gigaflow context slot */
+        gigaflow_xlate_ctx_increment_lookedup_tables_cnt(ctx.xin->gf_xlate_ctx);
+
         if (ctx.xin->resubmit_stats) {
             rule_dpif_credit_stats(ctx.rule, ctx.xin->resubmit_stats, false);
         }

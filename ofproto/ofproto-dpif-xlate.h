@@ -153,6 +153,9 @@ struct xlate_in {
      * match), 'vlan_tci' (normal action), and 'dl_dst' (normal action) fields
      * set. */
     struct flow_wildcards *wc;
+    
+    /* flow translation context required by Gigaflow mapper */
+    struct gigaflow_xlate_context *gf_xlate_ctx;
 
     /* The frozen state to be resumed, as returned by xlate_lookup(). */
     const struct frozen_state *frozen_state;
